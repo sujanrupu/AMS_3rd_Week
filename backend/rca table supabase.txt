@@ -1,0 +1,117 @@
+-- ════════════════════════════════════════════════
+-- 3. RCA KNOWLEDGE BASE TABLE (recreate clean)
+-- ════════════════════════════════════════════════
+DROP TABLE IF EXISTS rca_knowledge_base CASCADE;
+
+CREATE TABLE rca_knowledge_base (
+    id                  BIGSERIAL PRIMARY KEY,
+    confluence_page_id  TEXT UNIQUE,
+    title               TEXT NOT NULL,
+    category            TEXT NOT NULL,
+    app_code            TEXT NOT NULL DEFAULT 'GEN',
+    app_name            TEXT NOT NULL DEFAULT 'General',
+    component_code      TEXT NOT NULL DEFAULT 'GEN-CMP',
+    component_name      TEXT NOT NULL DEFAULT 'General',
+    keywords            TEXT NOT NULL,
+    symptoms            TEXT NOT NULL,
+    root_cause          TEXT NOT NULL,
+    affected_component  TEXT NOT NULL,
+    confidence          TEXT NOT NULL CHECK (confidence IN ('HIGH','MEDIUM','LOW')),
+    environment         TEXT DEFAULT 'Production',
+    recurrence_count    INT  DEFAULT 1,
+    status              TEXT DEFAULT 'Active'
+        CHECK (status IN ('Active','Deprecated','Under Review')),
+    embedding           VECTOR(384),
+    created_at          TIMESTAMP DEFAULT NOW(),
+    updated_at          TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_rca_kb_embedding
+ON rca_knowledge_base
+USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 100);
+
+
+-- ════════════════════════════════════════════════
+-- 4. match_rca_knowledge_base FUNCTION
+-- ════════════════════════════════════════════════
+DROP FUNCTION IF EXISTS match_rca_knowledge_base(VECTOR(384), INT);
+DROP FUNCTION IF EXISTS match_rca_knowledge_base(VECTOR(384), INT, TEXT, TEXT);
+
+CREATE OR REPLACE FUNCTION match_rca_knowledge_base(
+    query_embedding   VECTOR(384),
+    match_count       INT,
+    app_filter        TEXT DEFAULT NULL,
+    component_filter  TEXT DEFAULT NULL
+)
+RETURNS TABLE (
+    id                BIGINT,
+    title             TEXT,
+    category          TEXT,
+    app_code          TEXT,
+    app_name          TEXT,
+    component_code    TEXT,
+    component_name    TEXT,
+    keywords          TEXT,
+    symptoms          TEXT,
+    root_cause        TEXT,
+    affected_component TEXT,
+    confidence        TEXT,
+    similarity        FLOAT
+)
+LANGUAGE sql STABLE
+AS $$
+    SELECT
+        id, title, category,
+        app_code, app_name, component_code, component_name,
+        keywords, symptoms, root_cause, affected_component, confidence,
+        1 - (embedding <=> query_embedding) AS similarity
+    FROM rca_knowledge_base
+    WHERE
+        status    = 'Active'
+        AND embedding IS NOT NULL
+        AND (app_filter       IS NULL OR app_code       = app_filter)
+        AND (component_filter IS NULL OR component_code = component_filter)
+    ORDER BY embedding <=> query_embedding
+    LIMIT match_count;
+$$;
+
+
+-- ════════════════════════════════════════════════
+-- 7. match_completed_tickets_with_rca FUNCTION
+--    (no rca_steps, no rca_matched_from/summary)
+-- ════════════════════════════════════════════════
+DROP FUNCTION IF EXISTS match_completed_tickets_with_rca(VECTOR(384), INT);
+
+CREATE OR REPLACE FUNCTION match_completed_tickets_with_rca(
+    query_embedding VECTOR(384),
+    match_count     INT
+)
+RETURNS TABLE (
+    id             UUID,
+    issue_key      TEXT,
+    summary        TEXT,
+    description    TEXT,
+    status         TEXT,
+    rca_root_cause TEXT,
+    rca_affected   TEXT,
+    rca_confidence TEXT,
+    rca_source     TEXT,
+    similarity     FLOAT
+)
+LANGUAGE sql STABLE
+AS $$
+    SELECT
+        id, issue_key, summary, description, status,
+        rca_root_cause, rca_affected, rca_confidence, rca_source,
+        1 - (embedding <=> query_embedding) AS similarity
+    FROM tickets
+    WHERE
+        embedding      IS NOT NULL
+        AND rca_root_cause IS NOT NULL
+        AND status     = 'Completed'
+        AND is_duplicate = FALSE
+        AND child_key  IS NULL
+    ORDER BY embedding <=> query_embedding
+    LIMIT match_count;
+$$;

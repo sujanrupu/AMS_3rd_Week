@@ -1,0 +1,470 @@
+escalation_kb supabase file:
+-- ============================================================
+-- STEP 1 OF 3  —  ESCALATION KNOWLEDGE BASE
+-- Run this first in your Supabase SQL Editor.
+--
+-- This table IS the "company document" that humans normally
+-- search manually to decide where to escalate a ticket.
+-- Your AI will search this instead, instantly.
+-- ============================================================
+
+-- Enable the pgvector extension (only needs to run once per project)
+-- create extension if not exists vector;
+
+CREATE TABLE IF NOT EXISTS escalation_kb (
+    id                      BIGSERIAL PRIMARY KEY,
+
+    -- What kind of incident this covers
+    incident_category       TEXT NOT NULL,          -- e.g. "Network", "Database", "Security"
+    sub_category            TEXT,                   -- e.g. "VPN", "Replication", "Ransomware"
+    keywords                TEXT[],                 -- tags for fast keyword pre-filtering
+
+    -- A short example description of this type of incident
+    -- The AI's vector search runs against this field
+    example_description     TEXT NOT NULL,
+
+    -- What the org says to do for this type of incident
+    recommended_team        TEXT NOT NULL,          -- e.g. "Network Ops", "DBA Team"
+    recommended_level       TEXT NOT NULL,          -- L1, L2, or L3
+    rationale               TEXT NOT NULL,          -- why this team + level was chosen
+
+    -- Self-learning counters — updated automatically by human feedback loop
+    human_confirmed_count   INTEGER DEFAULT 0,      -- humans agreed with AI suggestion
+    human_corrected_count   INTEGER DEFAULT 0,      -- humans overrode AI suggestion
+    last_human_action_at    TIMESTAMPTZ,
+
+    -- Vector embedding of example_description (for semantic similarity search)
+    -- Populated by running escalation_kb_embedding.py after inserting rows
+    embedding               VECTOR(384),
+
+    created_at              TIMESTAMPTZ DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Index for fast vector similarity search
+CREATE INDEX IF NOT EXISTS escalation_kb_embedding_idx
+    ON escalation_kb
+    USING ivfflat (embedding vector_cosine_ops)
+    WITH (lists = 50);
+
+
+-- ============================================================
+-- SEED DATA  — ITSM style organization document
+--
+-- Teams:  Service Desk | Network Ops | DBA Team | App Support |
+--         DevOps | Platform Infra | Cloud Ops | Security Ops
+-- Levels: L1 (Service Desk) | L2 (Specialist) | L3 (Engineering Lead)
+-- ============================================================
+
+INSERT INTO escalation_kb
+    (incident_category, sub_category, keywords, example_description,
+     recommended_team, recommended_level, rationale)
+VALUES
+
+-- ─────────────────────────────────────────────────────────────
+-- L1  —  SERVICE DESK  (simple, well-known, standard procedures)
+-- ─────────────────────────────────────────────────────────────
+
+('Access Management', 'Password Reset',
+ ARRAY['password','reset','locked','unable to login','forgot','expired password'],
+ 'User is unable to log in because their password has expired or they have forgotten it. An immediate password reset is needed to restore access to their account and corporate systems.',
+ 'Service Desk', 'L1',
+ 'Standard access management task. Service Desk resolves via AD/LDAP reset procedure. No infrastructure impact, no specialist required.'),
+
+('Access Management', 'Account Unlock',
+ ARRAY['account locked','too many attempts','locked out','unlock account','login blocked'],
+ 'User account has been locked after multiple consecutive failed login attempts. Account unlock is required in Active Directory to allow the user to log in again.',
+ 'Service Desk', 'L1',
+ 'Routine account unlock. Service Desk handles via standard Active Directory procedure. No escalation required.'),
+
+('Access Management', 'New User Provisioning',
+ ARRAY['new user','onboarding','account creation','provisioning','access request','new employee'],
+ 'A new employee or contractor requires their user account to be created, groups assigned, and access provisioned to required corporate systems and tools.',
+ 'Service Desk', 'L1',
+ 'Standard onboarding request. Service Desk creates accounts and assigns access per provisioning checklist.'),
+
+('Application Support', 'Browser or Cache Issue',
+ ARRAY['slow','cache','browser','page not loading','stale data','refresh','blank screen','stuck'],
+ 'User reports the application is showing stale or incorrect data, or the page is not loading properly. Cache-clearing or a browser restart is likely to resolve the issue.',
+ 'Service Desk', 'L1',
+ 'No backend issue. Standard cache-clearing and browser troubleshooting guidance. L1 resolves via runbook.'),
+
+('Service Request', 'Software Installation',
+ ARRAY['install','software request','tool request','license','application install','setup'],
+ 'User is requesting installation of an approved software tool or license on their workstation. The software is on the approved corporate catalog.',
+ 'Service Desk', 'L1',
+ 'Standard software provisioning request. Service Desk coordinates with asset management to deploy the tool.'),
+
+('Service Request', 'Hardware Request',
+ ARRAY['hardware','laptop','mouse','keyboard','monitor','peripheral','equipment request'],
+ 'User is requesting a hardware peripheral or replacement equipment such as a laptop, keyboard, or monitor for their workstation.',
+ 'Service Desk', 'L1',
+ 'Standard hardware request. Service Desk coordinates with asset and procurement team.'),
+
+('Monitoring', 'False Alert',
+ ARRAY['false positive','alert','noise','monitor','false alarm','alert closed','spurious'],
+ 'An automated monitoring alert has fired but upon investigation there is no real underlying issue. The alert appears to be a false positive triggered by a transient spike or misconfigured threshold.',
+ 'Service Desk', 'L1',
+ 'Confirmation and suppression of false positive alert. L1 closes after verifying no real incident exists.'),
+
+('End User Support', 'Email or Outlook Issue',
+ ARRAY['email','outlook','mail not sending','inbox','calendar','mail client','email stuck'],
+ 'User is experiencing issues with their email client: mail is not sending, inbox is not refreshing, calendar is not syncing, or Outlook is not opening properly.',
+ 'Service Desk', 'L1',
+ 'Standard email client troubleshooting. Service Desk resolves via Outlook/Exchange runbook for common issues.'),
+
+('End User Support', 'Printer Issue',
+ ARRAY['printer','print','cannot print','print queue','offline printer','print job stuck'],
+ 'User is unable to print. The printer may be showing as offline, the print queue is stuck, or the printer driver needs to be reinstalled.',
+ 'Service Desk', 'L1',
+ 'Standard printer troubleshooting. Service Desk handles driver reinstall and queue clear via runbook.'),
+
+('End User Support', 'VDI or Remote Desktop',
+ ARRAY['vdi','virtual desktop','rdp','remote desktop','thin client','vdi session','citrix'],
+ 'User is unable to connect to their Virtual Desktop Infrastructure session or Remote Desktop. Connection is timing out or showing authentication errors.',
+ 'Service Desk', 'L1',
+ 'Initial VDI troubleshooting by Service Desk. If gateway issue confirmed, escalate to Network Ops L2.'),
+
+
+-- ─────────────────────────────────────────────────────────────
+-- L2  —  SPECIALIST TEAMS  (infrastructure, config, environment)
+-- ─────────────────────────────────────────────────────────────
+
+-- Network Ops L2
+('Network', 'Connectivity Loss',
+ ARRAY['network','connectivity','unreachable','timeout','packet loss','latency','ping','network down'],
+ 'Multiple users or services are reporting intermittent or total network connectivity loss. Ping tests show high packet loss or timeouts to key infrastructure hosts.',
+ 'Network Ops', 'L2',
+ 'Network issue requires specialist diagnosis. Network Ops checks routing tables, switches, WAN links, and upstream providers. Not resolvable by L1.'),
+
+('Network', 'VPN Failure',
+ ARRAY['vpn','remote access','tunnel','vpn down','cannot connect remotely','vpn disconnecting'],
+ 'Remote users are unable to connect to the corporate VPN. The VPN gateway may be unreachable, certificates may be expired, or authentication is failing for remote employees.',
+ 'Network Ops', 'L2',
+ 'VPN gateway and configuration issue. Network Ops manages VPN infrastructure, certificates, and remote access policies.'),
+
+('Network', 'DNS Resolution Failure',
+ ARRAY['dns','name resolution','cannot resolve','dns failure','domain lookup','hostname','dns timeout'],
+ 'Services are failing to resolve internal or external domain names. DNS resolution is failing for multiple hosts across the environment, causing application and service failures.',
+ 'Network Ops', 'L2',
+ 'DNS infrastructure issue. Network Ops manages DNS servers, zone configuration, and forwarder rules.'),
+
+('Network', 'Firewall or ACL Issue',
+ ARRAY['firewall','acl','blocked traffic','port blocked','firewall rule','network policy','access denied network'],
+ 'Application traffic is being blocked by a firewall rule or access control list. Ports or IP ranges need to be opened or a misconfigured rule needs to be corrected.',
+ 'Network Ops', 'L2',
+ 'Firewall and ACL changes require Network Ops. They manage rule sets across perimeter and internal firewalls.'),
+
+('Network', 'Load Balancer Issue',
+ ARRAY['load balancer','lb','nginx','haproxy','502','503','upstream','backend pool'],
+ 'The load balancer is returning 502 or 503 errors. One or more backend servers have been removed from the pool or health checks are failing causing traffic to drop.',
+ 'Network Ops', 'L2',
+ 'Load balancer configuration and health check management is owned by Network Ops in coordination with App Support.'),
+
+-- DBA Team L2
+('Database', 'Replication Lag',
+ ARRAY['replication','lag','replica','slave','standby','sync','replication delay','read replica'],
+ 'Database replication is falling behind. The replica is significantly lagging behind the primary database, causing stale reads on reporting systems and read replicas.',
+ 'DBA Team', 'L2',
+ 'Replication lag requires DBA investigation of I/O throughput, network bandwidth, and replication configuration. Not resolvable by L1 or App Support.'),
+
+('Database', 'Slow Query Performance',
+ ARRAY['slow query','query performance','database slow','query timeout','query taking long','index','execution plan'],
+ 'The application is experiencing slow response times due to long-running or unoptimised database queries. DBA analysis of query execution plans and indexing strategy is required.',
+ 'DBA Team', 'L2',
+ 'Query tuning and index analysis requires DBA expertise. App team has ruled out application code as the cause.'),
+
+('Database', 'Connection Pool Exhaustion',
+ ARRAY['too many connections','connection pool','max connections','connection refused database','db connections','pool exhausted'],
+ 'The application is exhausting available database connections. The connection pool limit has been reached and new requests are being refused with connection errors.',
+ 'DBA Team', 'L2',
+ 'Connection pool tuning and session management requires DBA. May also involve App Support if a connection leak is suspected in the application.'),
+
+('Database', 'Backup Failure',
+ ARRAY['backup failed','database backup','backup job','backup not completed','backup alert'],
+ 'The scheduled database backup job has failed or not completed within the expected window. Backup logs show errors and the backup file is missing or incomplete.',
+ 'DBA Team', 'L2',
+ 'Backup failure requires DBA investigation of backup agent, disk space, and backup configuration. RPO compliance at risk.'),
+
+('Database', 'Schema or Migration Issue',
+ ARRAY['migration','schema change','alter table','migration failed','schema error','db migration'],
+ 'A database schema migration or deployment has failed or partially applied, leaving the database in an inconsistent state that is blocking the application.',
+ 'DBA Team', 'L2',
+ 'Schema migration issues require DBA to assess impact, roll back partial changes, and coordinate with Dev team.'),
+
+-- App Support L2
+('Application', 'API Endpoint Failure',
+ ARRAY['api','endpoint','500','service unavailable','api down','rest','http error','4xx','5xx','api timeout'],
+ 'An internal API endpoint is returning 500 errors or is completely unreachable. Multiple downstream services that depend on this API are affected by failures or degraded performance.',
+ 'App Support', 'L2',
+ 'API failure requires application team investigation. Could be a configuration, deployment, or service dependency issue.'),
+
+('Application', 'Integration Failure',
+ ARRAY['integration','third party','webhook','connector','sync failed','external service','data not flowing','api key'],
+ 'An integration between two internal or external systems has stopped working. Data is not flowing between the systems as expected, causing data synchronisation failures.',
+ 'App Support', 'L2',
+ 'Integration issues require App Support to investigate service contracts, authentication tokens, and data mapping configuration.'),
+
+('Application', 'SSO or Authentication Failure',
+ ARRAY['sso','saml','oauth','single sign on','auth service','idp','identity provider','login broken','token expired'],
+ 'Single Sign-On authentication is failing for a subset of users or for specific applications. The identity provider or SAML assertion is returning errors or timeouts.',
+ 'App Support', 'L2',
+ 'SSO misconfiguration or IdP issue. App Support investigates with identity provider configuration and application trust settings.'),
+
+('Application', 'Feature Not Working',
+ ARRAY['feature broken','functionality not working','button not working','form not submitting','ui broken','module broken'],
+ 'A specific application feature or module is not working as expected. Users are unable to complete a workflow due to an application error or broken UI element.',
+ 'App Support', 'L2',
+ 'Application feature issue requiring App Support investigation. Could be a recent deployment regression or environment-specific issue.'),
+
+-- DevOps L2
+('Application', 'Deployment or Release Failure',
+ ARRAY['deployment','release','rollback','deploy failed','pipeline','ci/cd','build failed','release stuck'],
+ 'A recent deployment has caused application instability or outright failures. A rollback may be required to restore the previous stable version of the service.',
+ 'DevOps', 'L2',
+ 'Deployment issues are owned by DevOps. They manage pipeline configuration, rollback procedures, and environment promotion.'),
+
+('Application', 'CI/CD Pipeline Failure',
+ ARRAY['ci','cd','pipeline','jenkins','github actions','build pipeline','test failure','pipeline stuck'],
+ 'The continuous integration or continuous delivery pipeline has failed. Builds are failing, tests are not running, or deployments are not reaching the target environment.',
+ 'DevOps', 'L2',
+ 'CI/CD pipeline issues are managed by DevOps. They own the build tools, test runners, and deployment automation.'),
+
+-- Platform Infra L2
+('Infrastructure', 'High CPU or Memory',
+ ARRAY['cpu','memory','ram','high utilization','resource exhaustion','server slow','oom','out of memory','load average'],
+ 'A server or service is running at critically high CPU or memory utilisation. The system is degraded, response times are elevated, and the system is approaching its failure threshold.',
+ 'Platform Infra', 'L2',
+ 'Infrastructure resource issue. Platform Infra team investigates processes causing the spike, auto-scaling policies, and capacity planning.'),
+
+('Infrastructure', 'Disk Space Critical',
+ ARRAY['disk full','disk space','no space left','storage','filesystem full','disk usage','inode'],
+ 'A server filesystem is critically low on disk space. Application logs, database files, or temporary data are filling the volume and service degradation is occurring.',
+ 'Platform Infra', 'L2',
+ 'Disk space management requires Platform Infra. They handle volume expansion, log rotation policy, and data archival.'),
+
+('Infrastructure', 'Server Unreachable',
+ ARRAY['server down','server unreachable','ssh failed','cannot reach server','host not responding','ping timeout server'],
+ 'A specific server is unreachable via network, SSH, or monitoring. The server is not responding to health checks and services running on it are unavailable.',
+ 'Platform Infra', 'L2',
+ 'Server reachability issue requires Platform Infra to investigate OS-level issues, hardware, hypervisor, or network routing to that host.'),
+
+-- Cloud Ops L2
+('Cloud', 'Kubernetes Pod Failure',
+ ARRAY['pod','kubernetes','k8s','crashloopbackoff','container restart','oom kill','pod evicted','pending pod'],
+ 'Kubernetes pods are crashing or restarting in a loop. CrashLoopBackOff or OOMKill events are observed in the cluster and the service is degraded or unavailable.',
+ 'Cloud Ops', 'L2',
+ 'K8s pod issues require Cloud Ops to investigate resource limits, liveness probes, image pull issues, and cluster node health.'),
+
+('Cloud', 'Auto-scaling Failure',
+ ARRAY['autoscaling','scale out','scale in','ec2','cloud instance','capacity','asg','scaling policy'],
+ 'The auto-scaling group is failing to provision new instances during peak load. Capacity constraints are preventing the service from scaling, affecting application availability under load.',
+ 'Cloud Ops', 'L2',
+ 'Cloud infrastructure scaling requires Cloud Ops. They manage ASGs, launch configurations, and cloud resource quotas.'),
+
+('Cloud', 'Object Storage Issue',
+ ARRAY['s3','blob storage','object storage','gcs','bucket','file upload failed','storage access denied','presigned url'],
+ 'An application is failing to read from or write to cloud object storage. Errors include access denied, bucket not found, or upload timeouts affecting file-based workflows.',
+ 'Cloud Ops', 'L2',
+ 'Cloud storage access and configuration managed by Cloud Ops. May involve IAM policy review or bucket permission correction.'),
+
+('Security', 'Suspicious Login or Access',
+ ARRAY['suspicious login','unusual access','geo anomaly','impossible travel','mfa prompt','unfamiliar ip','access anomaly'],
+ 'The security monitoring system has flagged a suspicious login from an unfamiliar IP address or geographic location. Possible credential compromise or unauthorised access attempt on a user account.',
+ 'Security Ops', 'L2',
+ 'Suspicious access patterns require Security Ops to investigate SIEM alerts, verify user identity, and lock account if confirmed compromised.'),
+
+
+-- ─────────────────────────────────────────────────────────────
+-- L3  —  ENGINEERING LEAD  (code defects, full outages, security)
+-- ─────────────────────────────────────────────────────────────
+
+('Database', 'Data Corruption',
+ ARRAY['corruption','data loss','data integrity','corrupted','database crash','unrecoverable','checksum error'],
+ 'The production database is reporting data corruption errors. Queries are returning inconsistent or incorrect results, or the database has crashed with unrecoverable errors requiring recovery procedures.',
+ 'DBA Team', 'L3',
+ 'Database corruption is a P1 incident. Requires DBA Lead + Engineering Lead + immediate management notification. Data recovery assessment required.'),
+
+('Database', 'Production Database Outage',
+ ARRAY['database down','db outage','cannot connect to db','production database unavailable','all queries failing','primary db down'],
+ 'The production database is completely unavailable. All application queries are failing and every service that depends on the database is down, resulting in a full production outage.',
+ 'DBA Team', 'L3',
+ 'Complete DB outage is P1 L3. DBA Lead + Engineering Lead required. Parallel escalation to management and stakeholder communication.'),
+
+('Security', 'Security Breach or Ransomware',
+ ARRAY['ransomware','breach','hack','unauthorized access','malware','intrusion','data exfiltration','cryptolocker','lateral movement'],
+ 'A suspected or confirmed security breach has been detected. Unusual access patterns, ransomware encryption activity, or evidence of unauthorized data exfiltration has been identified in the environment.',
+ 'Security Ops', 'L3',
+ 'Security incident is always L3. Requires Security Ops Lead + CISO + Legal immediately. Containment, forensics, and incident response plan must activate.'),
+
+('Security', 'PII or Sensitive Data Exposure',
+ ARRAY['pii','data exposed','sensitive data','privacy','gdpr','data leak','customer data','personal data','data breach notification'],
+ 'Customer PII or sensitive business data may have been exposed externally. A misconfiguration, access control failure, or application bug has made regulated data accessible without authorisation.',
+ 'Security Ops', 'L3',
+ 'Data exposure triggers L3 + CISO + Legal + Compliance immediately. Regulatory notification timeline may be legally required under GDPR or local law.'),
+
+('Application', 'Full Production Application Outage',
+ ARRAY['production down','outage','all users affected','service down','complete failure','application unavailable','p1 outage','major incident'],
+ 'The production application is completely unavailable. All users across all regions are affected and no workaround exists. Business operations are halted.',
+ 'App Support', 'L3',
+ 'Full production outage is P1 L3. Engineering Lead takes ownership immediately. War room initiated and stakeholder communication required every 30 minutes.'),
+
+('Application', 'Code Defect Causing Data Corruption',
+ ARRAY['bug','defect','code issue','data corruption','wrong data','incorrect results','data integrity','bad data written','regression'],
+ 'A code defect is causing data to be written incorrectly or corrupted in the production database. Affected records may be spreading through downstream systems and may need manual remediation.',
+ 'App Support', 'L3',
+ 'Code defect + data corruption is always L3. Engineering Lead and DBA Lead must jointly assess scope of impact and plan remediation of affected data.'),
+
+('Payment', 'Payment System Complete Failure',
+ ARRAY['payment','transaction','billing','checkout','payment gateway','stripe','razorpay','payment failed','no transactions processing','revenue impact'],
+ 'The payment processing system is completely failing. No transactions are being processed and customers are unable to complete any purchases. Revenue impact is direct and immediate.',
+ 'App Support', 'L3',
+ 'Payment outage is L3 with parallel Finance team notification. Revenue impact requires Engineering Lead, App Support Lead, and business escalation immediately.'),
+
+('Infrastructure', 'Multiple Server Failure',
+ ARRAY['multiple servers','cluster failure','datacenter','infrastructure outage','cascading failure','rack failure','hypervisor down'],
+ 'Multiple servers or an entire infrastructure cluster have failed simultaneously. Cascading failures are spreading across dependent services as the core infrastructure is unavailable.',
+ 'Platform Infra', 'L3',
+ 'Multi-server failure indicates systemic infrastructure problem. L3 Engineering Lead with Platform Infra Lead for root cause. DR plan may need to activate.'),
+
+('Cloud', 'Cloud Region or Zone Outage',
+ ARRAY['region down','availability zone','aws outage','cloud provider','zone failure','disaster recovery','dr failover','cloud region'],
+ 'A cloud provider region or availability zone is experiencing an outage that is affecting our deployed production services. Workloads in that region are degraded or unavailable.',
+ 'Cloud Ops', 'L3',
+ 'Cloud region outage requires L3 for disaster recovery failover decision. Cloud Ops Lead + Engineering Lead + management. DR runbook must be initiated.'),
+
+('Authentication', 'All Users Locked Out',
+ ARRAY['all users','complete lockout','nobody can login','authentication down','auth outage','login service down','idp outage'],
+ 'All users across the organisation are unable to authenticate. The authentication service or identity provider is completely down, preventing any user from accessing any application.',
+ 'App Support', 'L3',
+ 'Complete auth outage is L3. No user can work. Engineering Lead takes ownership with App Support. IdP vendor escalation may be required in parallel.');
+
+
+-- ============================================================
+-- FUNCTION: Semantic similarity search on escalation_kb
+-- Returns top K rows by cosine similarity to a given embedding
+-- This is what the AI calls to search the "document"
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION search_escalation_kb(
+    query_embedding  VECTOR(384),
+    top_k            INTEGER DEFAULT 5,
+    min_similarity   FLOAT   DEFAULT 0.40
+)
+RETURNS TABLE (
+    id                      BIGINT,
+    incident_category       TEXT,
+    sub_category            TEXT,
+    recommended_team        TEXT,
+    recommended_level       TEXT,
+    rationale               TEXT,
+    example_description     TEXT,
+    human_confirmed_count   INTEGER,
+    human_corrected_count   INTEGER,
+    similarity              FLOAT
+)
+LANGUAGE sql STABLE AS $$
+    SELECT
+        id,
+        incident_category,
+        sub_category,
+        recommended_team,
+        recommended_level,
+        rationale,
+        example_description,
+        human_confirmed_count,
+        human_corrected_count,
+        1 - (embedding <=> query_embedding) AS similarity
+    FROM escalation_kb
+    WHERE embedding IS NOT NULL
+      AND 1 - (embedding <=> query_embedding) >= min_similarity
+    ORDER BY embedding <=> query_embedding
+    LIMIT top_k;
+$$;
+
+
+
+
+
+escalation_feedback supabase file:
+-- ============================================================
+-- STEP 2 OF 3  —  ESCALATION FEEDBACK TABLE + TICKET MIGRATION
+-- Run this AFTER 01_escalation_kb.sql
+--
+-- Two things happen here:
+--   1. Create the escalation_feedback table (human-in-the-loop log)
+--   2. Add escalation columns to your existing tickets table
+-- ============================================================
+
+
+-- ─────────────────────────────────────────────────────────────
+-- TABLE: escalation_feedback
+-- Every human triage action gets recorded here.
+-- This is how the AI learns over time.
+-- ─────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS escalation_feedback (
+    id                  BIGSERIAL PRIMARY KEY,
+
+    ticket_key          TEXT NOT NULL,              -- e.g. "AMS-123"
+
+    -- What the AI decided
+    ai_team             TEXT,                       -- NULL if quarantine (AI had no answer)
+    ai_level            TEXT,                       -- L1 / L2 / L3 / NULL
+    ai_confidence       TEXT,                       -- HIGH / MEDIUM / LOW
+
+    -- What the human decided
+    human_team          TEXT NOT NULL,
+    human_level         TEXT NOT NULL,              -- L1 / L2 / L3
+    human_reason        TEXT NOT NULL,              -- why they kept or changed the AI decision
+
+    -- Was the AI wrong?
+    was_overridden      BOOLEAN NOT NULL,           -- true if human changed AI decision
+    review_type         TEXT NOT NULL,              -- 'hitl_review' | 'quarantine_review'
+
+    created_at          TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Index for fast lookup by ticket key
+CREATE INDEX IF NOT EXISTS escalation_feedback_ticket_idx
+    ON escalation_feedback (ticket_key);
+
+-- Index for learning queries (team + level lookups)
+CREATE INDEX IF NOT EXISTS escalation_feedback_team_level_idx
+    ON escalation_feedback (human_team, human_level, was_overridden);
+
+
+-- ─────────────────────────────────────────────────────────────
+-- MIGRATE: Add escalation columns to the existing tickets table
+-- These columns store the AI escalation result per ticket.
+-- Run each line individually if any column already exists.
+-- ─────────────────────────────────────────────────────────────
+
+ALTER TABLE tickets
+    ADD COLUMN IF NOT EXISTS esc_team        TEXT,       -- e.g. "Network Ops"
+    ADD COLUMN IF NOT EXISTS esc_level       TEXT,       -- L1 / L2 / L3
+    ADD COLUMN IF NOT EXISTS esc_confidence  TEXT,       -- HIGH / MEDIUM / LOW
+    ADD COLUMN IF NOT EXISTS esc_action      TEXT,       -- AUTO_ROUTED / HITL_PENDING / QUARANTINE / HUMAN_FINALISED
+    ADD COLUMN IF NOT EXISTS esc_rationale   TEXT,       -- AI or human explanation
+    ADD COLUMN IF NOT EXISTS escalated_at    TIMESTAMPTZ;
+
+
+-- ─────────────────────────────────────────────────────────────
+-- FUNCTION: Count human confirmations for self-learning
+-- Returns how many times humans have confirmed (not overridden)
+-- a given team+level. Used by service.py to decide if AI should
+-- get a confidence boost for this routing path.
+-- ─────────────────────────────────────────────────────────────
+
+CREATE OR REPLACE FUNCTION get_escalation_feedback_count(
+    p_team   TEXT,
+    p_level  TEXT
+)
+RETURNS INTEGER
+LANGUAGE sql STABLE AS $$
+    SELECT COUNT(*)::INTEGER
+    FROM escalation_feedback
+    WHERE human_team   = p_team
+      AND human_level  = p_level
+      AND was_overridden = FALSE;
+$$;

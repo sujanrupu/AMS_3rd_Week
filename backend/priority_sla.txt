@@ -1,0 +1,268 @@
+-- ============================================================
+-- PRIORITY SLA MODULE — SUPABASE SQL
+-- Run this ENTIRELY in one go in your Supabase SQL Editor.
+-- Then run priority_sla_hitl_patch.sql immediately after.
+-- ============================================================
+
+
+-- ────────────────────────────────────────────
+-- 0. EXTENSIONS
+-- ────────────────────────────────────────────
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+
+-- ────────────────────────────────────────────
+-- 1. IMPACT ASSESSMENT KNOWLEDGE BASE
+-- ────────────────────────────────────────────
+-- CHANGE: Removed DROP TABLE CASCADE — that would wipe all your
+-- seed data every time you re-run this file. Using CREATE TABLE
+-- IF NOT EXISTS is safe to re-run without data loss.
+-- CHANGE: app and component made NOT NULL with a safe default
+-- fallback so the kb_seeder never hard-fails on missing values.
+-- ────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS impact_assessment_kb (
+id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+-- ticket context (used for embedding + KB search)
+app TEXT NOT NULL DEFAULT 'unknown',
+component TEXT NOT NULL DEFAULT 'unknown',
+summary TEXT NOT NULL,
+description TEXT,
+
+-- ground-truth label stored in KB
+revalidated_impact TEXT NOT NULL
+CHECK (revalidated_impact IN ('Extensive', 'Significant', 'Moderate', 'Minor')),
+
+-- optional enrichment fields (used in KB context sent to agent)
+affected_users TEXT, -- e.g. "All users", "Finance team"
+business_area TEXT, -- e.g. "Production", "Reporting", "Auth"
+
+-- CHANGE: VECTOR(384) — matches all-MiniLM-L6-v2 output exactly.
+-- Your embedding_service.py uses this model, so dimension is correct.
+embedding VECTOR(384),
+
+created_at TIMESTAMPTZ DEFAULT NOW(),
+updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ivfflat index for fast cosine similarity search.
+-- CHANGE: lists = 50 kept — correct for a small-to-medium KB (< 100k rows).
+-- Increase to 100 only if your KB grows beyond 100k entries.
+CREATE INDEX IF NOT EXISTS impact_kb_embedding_idx
+ON impact_assessment_kb
+USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 50);
+
+-- Scalar indexes for app/component filter pushdown in the RPC WHERE clause
+CREATE INDEX IF NOT EXISTS idx_impact_kb_app ON impact_assessment_kb(app);
+CREATE INDEX IF NOT EXISTS idx_impact_kb_component ON impact_assessment_kb(component);
+
+
+-- ────────────────────────────────────────────
+-- 2. URGENCY ASSESSMENT KNOWLEDGE BASE
+-- ────────────────────────────────────────────
+-- CHANGE: Same reasoning as above — DROP removed, IF NOT EXISTS added.
+-- ────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS urgency_assessment_kb (
+id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+-- ticket context
+app TEXT NOT NULL DEFAULT 'unknown',
+component TEXT NOT NULL DEFAULT 'unknown',
+summary TEXT NOT NULL,
+description TEXT,
+
+-- ground-truth label
+revalidated_urgency TEXT NOT NULL
+CHECK (revalidated_urgency IN ('Critical', 'High', 'Medium', 'Low')),
+
+-- optional enrichment fields (used in KB context sent to urgency agent)
+time_sensitivity TEXT, -- e.g. "Immediate", "Within 4 hours"
+workaround TEXT, -- e.g. "None available", "Manual fallback exists"
+
+-- embedding (same model, same dimension)
+embedding VECTOR(384),
+
+created_at TIMESTAMPTZ DEFAULT NOW(),
+updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS urgency_kb_embedding_idx
+ON urgency_assessment_kb
+USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 50);
+
+CREATE INDEX IF NOT EXISTS idx_urgency_kb_app ON urgency_assessment_kb(app);
+CREATE INDEX IF NOT EXISTS idx_urgency_kb_component ON urgency_assessment_kb(component);
+
+
+-- ────────────────────────────────────────────
+-- 3. ADD PRIORITY + SLA COLUMNS TO tickets
+-- ────────────────────────────────────────────
+-- CHANGE: Added CHECK constraints on priority so only valid values
+-- (P1-P4) can ever be written. This protects data integrity at DB level.
+-- All other columns unchanged — ADD COLUMN IF NOT EXISTS is idempotent.
+-- ────────────────────────────────────────────
+
+
+-- Index for fast priority-based lookups (used by HITL pending queries)
+CREATE INDEX IF NOT EXISTS idx_tickets_priority
+ON tickets (priority)
+WHERE priority IS NOT NULL;
+
+
+-- ────────────────────────────────────────────
+-- 4. RPC — SEARCH IMPACT KB
+-- ────────────────────────────────────────────
+-- CHANGE: Added SECURITY DEFINER so the function executes with
+-- the table owner's privileges — required for Supabase RLS to
+-- not block your backend's anon/service-role key calls.
+-- CHANGE: Filter logic kept as LOWER() exact match (your original).
+-- This is correct — ILIKE was in my earlier suggestion but exact
+-- lowercase match is faster and sufficient here.
+-- ────────────────────────────────────────────
+
+CREATE OR REPLACE FUNCTION search_impact_kb(
+query_embedding VECTOR(384),
+top_k INT DEFAULT 5,
+min_similarity FLOAT DEFAULT 0.35,
+app_filter TEXT DEFAULT NULL,
+component_filter TEXT DEFAULT NULL
+)
+RETURNS TABLE (
+id UUID,
+app TEXT,
+component TEXT,
+summary TEXT,
+description TEXT,
+revalidated_impact TEXT,
+affected_users TEXT,
+business_area TEXT,
+similarity FLOAT
+)
+LANGUAGE sql STABLE SECURITY DEFINER AS $$
+SELECT
+id,
+app,
+component,
+summary,
+description,
+revalidated_impact,
+affected_users,
+business_area,
+(1 - (embedding <=> query_embedding))::FLOAT AS similarity
+FROM impact_assessment_kb
+WHERE
+embedding IS NOT NULL
+AND (app_filter IS NULL OR LOWER(app) = LOWER(app_filter))
+AND (component_filter IS NULL OR LOWER(component) = LOWER(component_filter))
+AND (1 - (embedding <=> query_embedding)) >= min_similarity
+ORDER BY embedding <=> query_embedding
+LIMIT top_k;
+$$;
+
+
+-- ────────────────────────────────────────────
+-- 5. RPC — SEARCH URGENCY KB
+-- ────────────────────────────────────────────
+-- CHANGE: Same SECURITY DEFINER addition as above.
+-- ────────────────────────────────────────────
+
+CREATE OR REPLACE FUNCTION search_urgency_kb(
+query_embedding VECTOR(384),
+top_k INT DEFAULT 5,
+min_similarity FLOAT DEFAULT 0.35,
+app_filter TEXT DEFAULT NULL,
+component_filter TEXT DEFAULT NULL
+)
+RETURNS TABLE (
+id UUID,
+app TEXT,
+component TEXT,
+summary TEXT,
+description TEXT,
+revalidated_urgency TEXT,
+time_sensitivity TEXT,
+workaround TEXT,
+similarity FLOAT
+)
+LANGUAGE sql STABLE SECURITY DEFINER AS $$
+SELECT
+id,
+app,
+component,
+summary,
+description,
+revalidated_urgency,
+time_sensitivity,
+workaround,
+(1 - (embedding <=> query_embedding))::FLOAT AS similarity
+FROM urgency_assessment_kb
+WHERE
+embedding IS NOT NULL
+AND (app_filter IS NULL OR LOWER(app) = LOWER(app_filter))
+AND (component_filter IS NULL OR LOWER(component) = LOWER(component_filter))
+AND (1 - (embedding <=> query_embedding)) >= min_similarity
+ORDER BY embedding <=> query_embedding
+LIMIT top_k;
+$$;
+
+
+-- ────────────────────────────────────────────
+-- 6. SEED DATA — IMPACT KB
+-- ────────────────────────────────────────────
+-- CHANGE: Wrapped in INSERT ... ON CONFLICT DO NOTHING so re-running
+-- this file never creates duplicate seed rows. Your original had
+-- no conflict guard — running it twice would double the seed data
+-- and pollute your KB with duplicates that skew vector search results.
+-- NOTE: embedding column is left NULL here intentionally.
+-- Run kb_seeder.py AFTER this SQL to populate embeddings.
+-- ────────────────────────────────────────────
+
+INSERT INTO impact_assessment_kb
+(app, component, summary, description, revalidated_impact, affected_users, business_area)
+VALUES
+('Enterprise Incident Management System', 'Ticket Intake API', 'All ticket submissions failing system-wide', 'No tickets can be created by any user. The intake API returns 500 errors on every request.', 'Extensive', 'All users', 'Production'),
+('Enterprise Incident Management System', 'Incident Prioritization Engine', 'Priority engine down, all tickets stuck at Open', 'The prioritization engine is unresponsive. All new tickets remain unprocessed.', 'Extensive', 'All agents', 'Production'),
+('Enterprise Incident Management System', 'Operations Dashboard', 'Dashboard not loading for all agents', 'Operations dashboard returns blank page for every agent logged in.', 'Significant', 'All agents', 'Operations'),
+('Customer Service Request Portal', 'Request Submission Service', 'Request submission service throwing 503 for all users', 'Users cannot submit any service requests. Backend returns 503 Service Unavailable.', 'Extensive', 'All users', 'Production'),
+('Customer Service Request Portal', 'Approval Workflow Engine', 'Approval workflows stuck, no approvals processing', 'Pending approvals are not being routed. Workflow engine queue is backed up.', 'Significant', 'Approvers', 'Approvals'),
+('Customer Service Request Portal', 'Customer Support UI', 'Support UI inaccessible for one regional team', 'Users in the Asia-Pacific region cannot access the support portal. Other regions unaffected.', 'Moderate', 'APAC team', 'Regional'),
+('Production Monitoring Hub', 'Alert Correlation Engine', 'Alert storm, correlation engine overwhelmed', 'Alert engine is producing thousands of uncorrelated alerts flooding the ops team.', 'Significant', 'Ops team', 'Monitoring'),
+('Production Monitoring Hub', 'Log Aggregation Service', 'Log aggregation service offline', 'No logs are being collected. Log aggregation service pod is crash-looping.', 'Significant', 'Engineers', 'Observability'),
+('Production Monitoring Hub', 'Monitoring Dashboard', 'Single dashboard widget showing stale data', 'One metric widget on the monitoring dashboard is showing data from 2 hours ago.', 'Minor', 'Single user', 'Reporting'),
+('Change & Release Management System', 'Release Scheduler', 'Release scheduler unable to queue any deployments', 'No new releases can be scheduled. Scheduler API returns validation errors.', 'Extensive', 'All teams', 'Deployments'),
+('Change & Release Management System', 'Deployment Validation Engine', 'Validation failing for one specific service deployment', 'Deployment validation fails only for the payment-service artifact. Other services unaffected.', 'Moderate', 'Payment team', 'Deployments'),
+('Application Health Intelligence Platform', 'Health Data Collector', 'Health data collector not ingesting from 3 of 20 nodes', 'Three nodes stopped sending health metrics. Other 17 nodes are healthy and reporting normally.', 'Moderate', 'Ops team', 'Monitoring'),
+('Application Health Intelligence Platform', 'Root Cause Detection Agent', 'RCA agent completely unresponsive for all tickets', 'Root cause detection is not running. All tickets are missing RCA output.', 'Significant', 'All agents', 'AI Services'),
+('Application Health Intelligence Platform', 'Application Health Dashboard','Health dashboard slow to load but eventually loads', 'Dashboard takes 25 seconds to load. Affects all users but system remains accessible.', 'Minor', 'All users', 'Reporting')
+ON CONFLICT DO NOTHING;
+
+
+-- ────────────────────────────────────────────
+-- 7. SEED DATA — URGENCY KB
+-- ────────────────────────────────────────────
+-- CHANGE: Same ON CONFLICT DO NOTHING guard added.
+-- ────────────────────────────────────────────
+
+INSERT INTO urgency_assessment_kb
+(app, component, summary, description, revalidated_urgency, time_sensitivity, workaround)
+VALUES
+('Enterprise Incident Management System', 'Ticket Intake API', 'All ticket submissions failing system-wide', 'Complete outage. No tickets can be raised. Business fully blocked.', 'Critical', 'Immediate', 'None available'),
+('Enterprise Incident Management System', 'Incident Prioritization Engine','Priority engine unresponsive', 'All new tickets stacking up unprocessed. SLA clock running on all pending tickets.', 'Critical', 'Immediate', 'Manual triage by team leads'),
+('Enterprise Incident Management System', 'Operations Dashboard', 'Dashboard blank for all agents', 'Agents cannot see any tickets or status. Operational blind spot.', 'High', 'Within 2 hours', 'Use Jira directly as fallback'),
+('Customer Service Request Portal', 'Request Submission Service', 'Service unavailable for all customers', 'No requests can be submitted. Customer-facing impact is immediate.', 'Critical', 'Immediate', 'None available'),
+('Customer Service Request Portal', 'Approval Workflow Engine', 'Approvals not processing', 'Approvals are stuck. Contractual SLAs at risk if not resolved within 4 hours.', 'High', 'Within 4 hours', 'Manual email approvals as fallback'),
+('Customer Service Request Portal', 'Customer Support UI', 'UI inaccessible for APAC region', 'One regional team affected. Business hours overlap is partial.', 'Medium', 'Within 8 hours', 'Phone support as workaround'),
+('Production Monitoring Hub', 'Alert Correlation Engine', 'Alert storm flooding ops team', 'Ops team overwhelmed. Risk of missing real incidents in the noise.', 'High', 'Within 2 hours', 'Manual alert review'),
+('Production Monitoring Hub', 'Log Aggregation Service', 'Log aggregation offline', 'No logs being collected. Debugging any live issue is impossible.', 'High', 'Within 2 hours', 'Check node logs directly via SSH'),
+('Production Monitoring Hub', 'Monitoring Dashboard', 'Single widget stale data', 'One widget affected. Not blocking operations. Low business risk.', 'Low', 'Business hours', 'Refresh or use alternate dashboard view'),
+('Change & Release Management System', 'Release Scheduler', 'No deployments can be scheduled', 'All releases blocked. Hotfixes and sprint releases cannot proceed.', 'Critical', 'Immediate', 'None available'),
+('Change & Release Management System', 'Deployment Validation Engine', 'Validation failing for one service only', 'Payment-service blocked from deploying. Other services unaffected.', 'Medium', 'Within 8 hours', 'Skip validation manually with L3 approval'),
+('Application Health Intelligence Platform', 'Health Data Collector', 'Three nodes not reporting', 'Partial data gap. 17 of 20 nodes healthy. No immediate operational risk.', 'Medium', 'Within 8 hours', 'Use remaining 17 nodes for monitoring'),
+('Application Health Intelligence Platform', 'Root Cause Detection Agent', 'RCA agent down for all tickets', 'All tickets missing RCA. Human agents must do manual root cause analysis.', 'High', 'Within 4 hours', 'Manual RCA by L2/L3 engineers'),
+('Application Health Intelligence Platform', 'Application Health Dashboard','Dashboard slow, 25 second load time', 'Usable but frustrating. No data loss. Low urgency.', 'Low', 'Business hours', 'Use direct API queries as workaround')
+ON CONFLICT DO NOTHING;

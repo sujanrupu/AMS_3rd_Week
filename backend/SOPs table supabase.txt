@@ -1,0 +1,41 @@
+SOPs table schema:
+
+-- =========================================
+-- SOPs TABLE
+-- =========================================
+
+CREATE TABLE sops (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    -- SOP ID
+    sop_code TEXT UNIQUE NOT NULL,
+
+    -- Vector embedding
+    embedding VECTOR(384)
+);
+
+drop SOP function:
+
+DROP FUNCTION IF EXISTS match_sops;
+
+match SOP function:
+
+-- =========================================
+-- VECTOR SEARCH FUNCTION
+-- =========================================
+DROP FUNCTION IF EXISTS match_sops;
+
+CREATE OR REPLACE FUNCTION match_sops(
+    query_embedding vector(384),
+    match_count     int
+)
+RETURNS TABLE (sop_code text, similarity float)
+LANGUAGE sql STABLE
+AS $$
+    SELECT
+        sop_code,
+        1 - (embedding <=> query_embedding) AS similarity
+    FROM sops
+    ORDER BY embedding <=> query_embedding
+    LIMIT match_count;
+$$;
